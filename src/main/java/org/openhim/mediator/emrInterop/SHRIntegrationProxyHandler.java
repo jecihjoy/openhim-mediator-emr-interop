@@ -14,18 +14,31 @@ import akka.event.LoggingAdapter;
 import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.parser.DataFormatException;
 import ca.uhn.fhir.parser.IParser;
+import ca.uhn.fhir.rest.client.api.IGenericClient;
 import ca.uhn.fhir.util.OperationOutcomeUtil;
 import ca.uhn.fhir.validation.FhirValidator;
 import ca.uhn.fhir.validation.ValidationResult;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.http.HttpStatus;
+import org.hl7.fhir.instance.model.api.IAnyResource;
 import org.hl7.fhir.instance.model.api.IBaseOperationOutcome;
 import org.hl7.fhir.instance.model.api.IBaseResource;
+import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.Encounter;
+import org.hl7.fhir.r4.model.Location;
+import org.hl7.fhir.r4.model.Observation;
+import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Practitioner;
+import org.hl7.fhir.r4.model.Reference;
+import org.hl7.fhir.r4.model.Resource;
 import org.openhim.mediator.engine.MediatorConfig;
 import org.openhim.mediator.engine.messages.FinishRequest;
 import org.openhim.mediator.engine.messages.MediatorHTTPRequest;
 import org.openhim.mediator.engine.messages.MediatorHTTPResponse;
 
+import javax.annotation.Nonnull;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -103,7 +116,7 @@ public class SHRIntegrationProxyHandler extends UntypedActor {
                 (String) config.getDynamicConfig().get("upstream-scheme"),
                 (String) config.getDynamicConfig().get("upstream-host"),
                 ((Double) config.getDynamicConfig().get("upstream-port")).intValue(),
-                "/fhir/Patient",
+                "/fhir/",
                 body,
                 headers,
                 copyParams(request.getParams())
@@ -164,9 +177,57 @@ public class SHRIntegrationProxyHandler extends UntypedActor {
                 ("XML".equalsIgnoreCase(upstreamFormat) && clientContentType.contains("xml"));
     }
 
-    private void processRequestWithContents() {
+    private void processRequestWithContents() throws ClassNotFoundException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
         String contentType = request.getHeaders().get("Content-Type");
         String body = request.getBody();
+        IParser parser = fhirContext.newJsonParser();
+        IBaseResource resource = parser.parseResource(body);
+        if (resource.getClass().getSimpleName().equals("Bundle")) {
+            log.error("this is a bundle");
+            Bundle bundle = (Bundle) resource;
+            Bundle subjectResource = fetchPatientResource("MOH1667372638");
+
+            if (bundle.hasEntry()) {
+                Reference subjectRef = new Reference();
+                if (subjectResource.hasEntry()) {
+                    subjectRef = createPatientReference((Patient) subjectResource.getEntry().get(0).getResource());
+                }
+                Reference practitionerRef = createPractitionerReferenceBase((Practitioner) fetchFhirResource("Practitioner", Constants.INTEROP_PROVIDER_UUID));
+                Encounter.EncounterParticipantComponent participantComponent = new Encounter.EncounterParticipantComponent();
+                participantComponent.setIndividual(practitionerRef);
+
+                Bundle facilityResource = fetchLocationResource("10538");
+                Location facility = new Location();
+                if (facilityResource.hasEntry()) {
+                    facility = (Location) facilityResource.getEntry().get(0).getResource();
+                }
+
+                for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+                    String resourceType = entry.getResource().getResourceType().toString();
+                    switch (resourceType) {
+                        case "Observation":
+                            Observation observation = (Observation) entry.getResource();
+                            observation.setSubject(subjectRef);
+                            entry.setResource(observation);
+                            break;
+                        case "Encounter":
+                            Encounter encounter = (Encounter) entry.getResource();
+                            encounter.setSubject(subjectRef);
+                            entry.setResource(encounter);
+                            encounter.setParticipant(new ArrayList<>());
+                            encounter.addParticipant(participantComponent);
+                            encounter.getLocationFirstRep().setLocation(createLocationReference(facility));
+                            break;
+                        default:
+                            log.error("default logging");
+                    }
+
+                }
+
+            }
+
+        }
+        
         Contents contents = new Contents(contentType, body);
 
         if ((Boolean) config.getDynamicConfig().get("validation-enabled")) {
@@ -186,10 +247,99 @@ public class SHRIntegrationProxyHandler extends UntypedActor {
         forwardRequest(contents);
     }
 
+    private String getResourceUuid(String resourceUrl) {
+        String[] sepUrl = resourceUrl.split("/");
+        return sepUrl[sepUrl.length - 3];
+    }
+
+    private Reference createPatientReference(@Nonnull Patient patient) {
+        Reference reference = new Reference().setReference("/Patient/" + getResourceUuid(patient.getId()))
+                .setType("Patient");
+        return reference;
+    }
+
+    private Reference createPractitionerReferenceBase(@Nonnull Practitioner practitioner) {
+        Reference reference = (new Reference()).setReference("Practitioner/" + getResourceUuid(practitioner.getId())).setType("Practitioner");
+        if (!practitioner.getName().isEmpty()) {
+            reference.setDisplay(practitioner.getName().get(0).getGivenAsSingleString());
+        }
+
+        return reference;
+    }
+
+    protected Reference createLocationReference(@Nonnull Location location) {
+        Reference reference = (new Reference()).setReference("Location/" + getResourceUuid(location.getId())).setType("Location");
+        if (!location.getName().isEmpty()) {
+            reference.setDisplay(location.getName());
+        }
+
+        return reference;
+    }
+
+    private IGenericClient getFhirClient() {
+        FhirContext fhirContextNew = FhirContext.forR4();
+        String serverUrl = "http://localhost:8098/fhir/";
+
+        fhirContextNew.getRestfulClientFactory().setSocketTimeout(200 * 1000);
+
+        IGenericClient client = fhirContextNew.getRestfulClientFactory().newGenericClient(serverUrl);
+        return client;
+    }
+
+    public Bundle fetchPatientResource(String identifier) {
+        try {
+
+            IGenericClient client = getFhirClient();
+
+            Bundle resource = client.search().forResource("Patient").where(Patient.IDENTIFIER.exactly().code(identifier))
+                    .returnBundle(Bundle.class).execute();
+            log.error("resource " + resource.hasEntry());
+            return resource;
+        } catch (Exception e) {
+            log.error(String.format("Failed fetching FHIR resource %s", e));
+            return null;
+        }
+    }
+
+    public Bundle fetchLocationResource(String identifier) {
+        try {
+            IGenericClient client = getFhirClient();
+            Bundle resource = client.search().forResource("Location").where(Location.IDENTIFIER.exactly().code(identifier))
+                    .returnBundle(Bundle.class).execute();
+            return resource;
+        } catch (Exception e) {
+            log.error(String.format("Failed fetching FHIR resource %s", e));
+            return null;
+        }
+    }
+
+    public Resource fetchFhirResource(String resourceType, String resourceId) {
+        try {
+            IGenericClient client = getFhirClient();
+            IBaseResource resource = client.read().resource(resourceType).withId(resourceId).execute();
+            return (Resource) resource;
+        } catch (Exception e) {
+            log.error(String.format("Failed fetching FHIR %s resource with Id %s: %s", resourceType, resourceId, e));
+            return null;
+        }
+    }
+
     private void processClientRequest() {
         try {
             if (request.getMethod().equalsIgnoreCase("POST") || request.getMethod().equalsIgnoreCase("PUT")) {
-                processRequestWithContents();
+                try {
+                    processRequestWithContents();
+                } catch (ClassNotFoundException e) {
+                    throw new RuntimeException(e);
+                } catch (InvocationTargetException e) {
+                    throw new RuntimeException(e);
+                } catch (NoSuchMethodException e) {
+                    throw new RuntimeException(e);
+                } catch (InstantiationException e) {
+                    throw new RuntimeException(e);
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException(e);
+                }
             } else {
                 forwardRequest();
             }
